@@ -1,0 +1,162 @@
+name: Release All Platforms
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. 1.0.0)
+        required: true
+      gitee_repo:
+        description: Gitee source URL (no credentials)
+        required: false
+        default: https://gitee.com/psvmc/z-img-tools-tauri.git
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-22.04
+            platform: linux
+          - os: macos-latest
+            platform: macos
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Clone from Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ inputs.gitee_repo }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEE_TOKEN:-}" ]; then
+            echo "::error::Set secret GITEE_TOKEN on this repository (Gitee private token, scope: projects)"
+            exit 1
+          fi
+          REPO_PATH="${GITEE_REPO#https://}"
+          AUTH_URL="https://oauth2:${GITEE_TOKEN}@${REPO_PATH}"
+
+          git config --global http.postBuffer 524288000
+          git config --global http.version HTTP/1.1
+
+          TAG_CANDIDATES=("$RELEASE_TAG")
+          if [[ "$RELEASE_TAG" == v* ]]; then
+            TAG_CANDIDATES+=("${RELEASE_TAG#v}")
+          else
+            TAG_CANDIDATES+=("v${RELEASE_TAG}")
+          fi
+
+          clone_ok=false
+          for TAG in "${TAG_CANDIDATES[@]}"; do
+            for attempt in 1 2 3; do
+              echo "Cloning tag ${TAG} (attempt ${attempt})..."
+              rm -rf repo
+              if git clone --depth 1 --branch "$TAG" "$AUTH_URL" repo; then
+                echo "Cloned tag ${TAG}"
+                clone_ok=true
+                break 2
+              fi
+              sleep $((attempt * 5))
+            done
+          done
+
+          if [ "$clone_ok" != true ]; then
+            echo "::error::Failed to clone tag ${RELEASE_TAG} from Gitee. Push the tag first: git tag ${RELEASE_TAG#v} && git push origin ${RELEASE_TAG#v}"
+            exit 1
+          fi
+
+      - name: Install NSIS (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: choco install nsis -y --no-progress
+
+      - name: Install Linux deps
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: repo/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: repo/src-tauri -> target
+
+      - name: Build
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          node -e "
+            const fs = require('fs');
+            const path = 'src-tauri/tauri.conf.json';
+            const cfg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            cfg.bundle.active = true;
+            fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n');
+          "
+          mkdir -p release
+
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            npm run tauri build -- --bundles nsis
+            find src-tauri/target -path '*/release/bundle/nsis/*.exe' -exec cp -f {} release/ \;
+          elif [ "${{ matrix.platform }}" = "linux" ]; then
+            npm run tauri build -- --bundles deb
+            find src-tauri/target -path '*/release/bundle/deb/*.deb' -exec cp -f {} release/ \;
+          else
+            npm run tauri build -- --target universal-apple-darwin --bundles dmg
+            find src-tauri/target -path '*/release/bundle/dmg/*.dmg' -exec cp -f {} release/ \;
+          fi
+
+          if [ -z "$(ls -A release 2>/dev/null)" ]; then
+            echo "::error::No release artifacts found"
+            find src-tauri/target -path '*/release/bundle/*' -type f | head -50
+            exit 1
+          fi
+          ls -la release/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: repo/release/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release files
+        run: find dist -type f -ls
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          target_commitish: main
+          name: ZImgTools ${{ inputs.tag }}
+          generate_release_notes: true
+          files: dist/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
