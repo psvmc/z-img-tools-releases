@@ -150,13 +150,88 @@ jobs:
       - name: List release files
         run: find dist -type f -ls
 
+      - name: Generate release notes from git log
+        id: changelog
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ inputs.gitee_repo }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEE_TOKEN:-}" ]; then
+            echo "::error::Set secret GITEE_TOKEN on this repository"
+            exit 1
+          fi
+
+          REPO_PATH="${GITEE_REPO#https://}"
+          AUTH_URL="https://oauth2:${GITEE_TOKEN}@${REPO_PATH}"
+
+          git clone --filter=blob:none "$AUTH_URL" repo
+          cd repo
+          git fetch --tags origin
+
+          resolve_tag() {
+            local input="$1"
+            local candidates=("$input")
+            if [[ "$input" == v* ]]; then
+              candidates+=("${input#v}")
+            else
+              candidates+=("v${input}")
+            fi
+            for candidate in "${candidates[@]}"; do
+              if git rev-parse -q --verify "refs/tags/${candidate}^{commit}" >/dev/null; then
+                echo "$candidate"
+                return 0
+              fi
+            done
+            echo "::error::Tag ${input} not found in Gitee repository"
+            exit 1
+          }
+
+          TAG="$(resolve_tag "$RELEASE_TAG")"
+
+          mapfile -t SORTED_TAGS < <(git tag -l --sort=-version:refname)
+          PREV_TAG=""
+          for i in "${!SORTED_TAGS[@]}"; do
+            if [ "${SORTED_TAGS[$i]}" = "$TAG" ]; then
+              if [ $((i + 1)) -lt ${#SORTED_TAGS[@]} ]; then
+                PREV_TAG="${SORTED_TAGS[$((i + 1))]}"
+              fi
+              break
+            fi
+          done
+
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${TAG}"
+            HEADER="## Changes since ${PREV_TAG}"
+          else
+            RANGE="$TAG"
+            HEADER="## Initial release"
+          fi
+
+          NOTES="$(git log "$RANGE" --pretty=format:'- %s (%h)' --no-merges || true)"
+          if [ -z "$NOTES" ]; then
+            NOTES="- No commits in this range"
+          fi
+
+          BODY="${HEADER}
+
+          ${NOTES}"
+
+          {
+            echo 'body<<CHANGELOG_EOF'
+            echo "$BODY"
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
           target_commitish: main
           name: ZImgTools ${{ inputs.tag }}
-          generate_release_notes: true
+          body: ${{ steps.changelog.outputs.body }}
           files: dist/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
