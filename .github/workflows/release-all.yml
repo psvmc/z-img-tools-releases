@@ -104,18 +104,11 @@ jobs:
         run: |
           set -euo pipefail
           npm ci
-          node -e "
-            const fs = require('fs');
-            const path = 'src-tauri/tauri.conf.json';
-            const cfg = JSON.parse(fs.readFileSync(path, 'utf8'));
-            cfg.bundle.active = true;
-            fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n');
-          "
           mkdir -p release
 
           if [ "${{ matrix.platform }}" = "windows" ]; then
             npm run tauri build -- --bundles nsis
-            find src-tauri/target -path '*/release/bundle/nsis/*.exe' -exec cp -f {} release/ \;
+            find src-tauri/target -path '*/release/bundle/nsis/*-setup.exe' -exec cp -f {} release/ \;
           elif [ "${{ matrix.platform }}" = "linux" ]; then
             npm run tauri build -- --bundles deb
             find src-tauri/target -path '*/release/bundle/deb/*.deb' -exec cp -f {} release/ \;
